@@ -126,6 +126,57 @@ function handleMany(siftArgs, nodes) {
 }
 
 /**
+ * finds the intersection of
+ * two arrays in a simple fashion.
+ *
+ * PARAMS
+ *  a - first array, must already be sorted
+ *  b - second array, must already be sorted
+ *
+ * NOTES
+ *
+ *  Should have O(n) operations, where n is
+ *    n = MIN(a.length(), b.length())
+ *
+ * @param {Array<IGatsbyNode>} a Ordered by id, ascending
+ * @param {Array<IGatsbyNode>} b Ordered by id, ascending
+ * @returns {Array<IGatsbyNode>} Ordered by id, ascending
+ */
+function intersectNodes(a, b) {
+  let ai = 0
+  let bi = 0
+  let result = []
+  let alen = a.length
+  let blen = b.length
+  let lastAdded = undefined // Used to dedupe the list
+
+  while (ai < alen && bi < blen) {
+    const nodeA = a[ai]
+    const nodeB = b[bi]
+    const idA = nodeA.id
+    const idB = nodeB.id
+    if (idA < idB) {
+      ai++
+    } else if (idA > idB) {
+      bi++
+    } else {
+      // nodeA===nodeB. Make sure we didn't just add this node already.
+      // Since input arrays are sorted by id, the same node should be grouped
+      // back to back, so even if both input arrays contained the same node
+      // twice, this check would prevent the result from getting duplicate nodes
+      if (lastAdded !== nodeA) {
+        result.push(nodeA)
+        lastAdded = nodeA
+      }
+      ai++
+      bi++
+    }
+  }
+
+  return result
+}
+
+/**
  * Given the path of a set of filters, return the sets of nodes that pass the
  * filter.
  * Only nodes of given node types will be considered
@@ -145,45 +196,46 @@ const filterWithoutSift = (filters, nodeTypeNames, filtersCache) => {
     return null
   }
 
-  const nodesPerValueSets /*: Array<Set<IGatsbyNode>> */ = getBucketsForFilters(
+  const nodesPerValueArrs /*: Array<Array<IGatsbyNode>> */ = getBucketsForFilters(
     filters,
     nodeTypeNames,
     filtersCache
   )
 
-  if (!nodesPerValueSets) {
-    // Let Sift take over as fallback
+  if (!nodesPerValueArrs) {
     return null
+  }
+
+  if (nodesPerValueArrs.length === 0) {
+    return []
   }
 
   // Put smallest last (we'll pop it)
-  nodesPerValueSets.sort(
-    (a /*: Set<IGatsbyNode> */, b /*: Set<IGatsbyNode> */) => b.size - a.size
+  nodesPerValueArrs.sort(
+    (a /*: Array<IGatsbyNode> */, b /*: Array<IGatsbyNode> */) =>
+      b.length - a.length
   )
-  // Iterate on the set with the fewest elements and create the intersection
-  const needles /*: Set<IGatsbyNode>*/ = nodesPerValueSets.pop()
-  // Take the intersection of the retrieved caches-by-value
-  const result /*: Array<IGatsbyNode> */ = []
 
-  // This _can_ still be expensive but the set of nodes should be limited ...
-  needles.forEach((node /*: IGatsbyNode */) => {
-    if (
-      nodesPerValueSets.every((cache /*: Set<IGatsbyNode> */) =>
-        cache.has(node)
-      )
-    ) {
-      // Every cache set contained this node so keep it
-      result.push(node)
-    }
-  })
+  if (nodesPerValueArrs.length === 1) {
+    // If there's only one bucket then we have to run it against itself to
+    // make sure it doesn't contain dupes. Otherwise the deduping would
+    // already happen while merging.
+    nodesPerValueArrs.push(nodesPerValueArrs[nodesPerValueArrs.length - 1])
+  }
 
-  // TODO: do we cache this result? I'm not sure how likely it is to be reused
-  // Consider the case of {a: {eq: 5}, b: {eq: 10}}, do we cache the [5,10]
-  // case for all value pairs? How likely is that to ever be reused?
+  while (nodesPerValueArrs.length > 1) {
+    nodesPerValueArrs.push(
+      intersectNodes(nodesPerValueArrs.pop(), nodesPerValueArrs.pop())
+    )
+  }
+
+  const result = nodesPerValueArrs[0]
 
   if (result.length === 0) {
+    // Intersection came up empty. Not one node appeared in every bucket.
     return null
   }
+
   return result
 }
 
@@ -194,11 +246,11 @@ exports.filterWithoutSift = filterWithoutSift
  * @param {Array<DbQuery>} filters
  * @param {Array<string>} nodeTypeNames
  * @param {FiltersCache} filtersCache
- * @returns {Array<Set<IGatsbyNode>> | undefined} Undefined means at least one
+ * @returns {Array<Array<IGatsbyNode>> | undefined} Undefined means at least one
  *   cache was not found. Must fallback to sift.
  */
 const getBucketsForFilters = (filters, nodeTypeNames, filtersCache) => {
-  const nodesPerValueSets /*: Array<Set<IGatsbyNode>>*/ = []
+  const nodesPerValueArrs /*: Array<Array<IGatsbyNode>>*/ = []
 
   // Fail fast while trying to create and get the value-cache for each path
   let every = filters.every((filter /*: DbQuery*/) => {
@@ -211,7 +263,7 @@ const getBucketsForFilters = (filters, nodeTypeNames, filtersCache) => {
         q,
         nodeTypeNames,
         filtersCache,
-        nodesPerValueSets
+        nodesPerValueArrs
       )
     } else {
       // (Let TS warn us if a new query type gets added)
@@ -221,13 +273,13 @@ const getBucketsForFilters = (filters, nodeTypeNames, filtersCache) => {
         q,
         nodeTypeNames,
         filtersCache,
-        nodesPerValueSets
+        nodesPerValueArrs
       )
     }
   })
 
   if (every) {
-    return nodesPerValueSets
+    return nodesPerValueArrs
   }
 
   // "failed at least one"
@@ -241,7 +293,7 @@ const getBucketsForFilters = (filters, nodeTypeNames, filtersCache) => {
  * @param {IDbQueryQuery} filter
  * @param {Array<string>} nodeTypeNames
  * @param {FiltersCache} filtersCache
- * @param {Array<Set<IgatsbyNode>>} nodesPerValueSets
+ * @param {Array<Array<IGatsbyNode>>} nodesPerValueArrs
  * @returns {boolean} false means soft fail, filter must go through Sift
  */
 const getBucketsForQueryFilter = (
@@ -249,7 +301,7 @@ const getBucketsForQueryFilter = (
   filter,
   nodeTypeNames,
   filtersCache,
-  nodesPerValueSets
+  nodesPerValueArrs
 ) => {
   let {
     path: filterPath,
@@ -266,7 +318,7 @@ const getBucketsForQueryFilter = (
     )
   }
 
-  const nodesPerValue /*: Set<IGatsbyNode> | undefined */ = getNodesFromCacheByValue(
+  const nodesPerValue /*: Array<IGatsbyNode> | undefined */ = getNodesFromCacheByValue(
     filterCacheKey,
     filterValue,
     filtersCache
@@ -279,9 +331,9 @@ const getBucketsForQueryFilter = (
     return false
   }
 
-  // In all other cases this must be a non-empty Set because the indexing
-  // mechanism does not create a Set unless there's a IGatsbyNode for it
-  nodesPerValueSets.push(nodesPerValue)
+  // In all other cases this must be a non-empty arr because the indexing
+  // mechanism does not create an array unless there's a IGatsbyNode for it
+  nodesPerValueArrs.push(nodesPerValue)
 
   return true
 }
@@ -291,14 +343,14 @@ const getBucketsForQueryFilter = (
  * @param {IDbQueryElemMatch} filter
  * @param {Array<string>} nodeTypeNames
  * @param {FiltersCache} filtersCache
- * @param {Array<Set<IGatsbyNode>>} nodesPerValueSets Matching node sets are put in this array
+ * @param {Array<Array<IGatsbyNode>>} nodesPerValueArrs Matching node arrs are put in this array
  */
 const collectBucketForElemMatch = (
   filterCacheKey,
   filter,
   nodeTypeNames,
   filtersCache,
-  nodesPerValueSets
+  nodesPerValueArrs
 ) => {
   // Get comparator and target value for this elemMatch
   let comparator = ``
@@ -326,7 +378,7 @@ const collectBucketForElemMatch = (
     )
   }
 
-  const nodesByValue /*: Set<IGatsbyNode> | undefined*/ = getNodesFromCacheByValue(
+  const nodesByValue /*: Array<IGatsbyNode> | undefined*/ = getNodesFromCacheByValue(
     filterCacheKey,
     targetValue,
     filtersCache
@@ -339,9 +391,9 @@ const collectBucketForElemMatch = (
     return false
   }
 
-  // In all other cases this must be a non-empty Set because the indexing
-  // mechanism does not create a Set unless there's a IGatsbyNode for it
-  nodesPerValueSets.push(nodesByValue)
+  // In all other cases this must be a non-empty arr because the indexing
+  // mechanism does not create an array unless there's a IGatsbyNode for it
+  nodesPerValueArrs.push(nodesByValue)
 
   return true
 }
@@ -355,7 +407,7 @@ const collectBucketForElemMatch = (
  * @property {{filter?: Object, sort?: Object} | undefined} args.queryArgs
  * @property {undefined | null | FiltersCache} args.filtersCache May be null or
  *   undefined. A cache of indexes where you can look up Nodes grouped by a
- *   FilterCacheKey, which yields a Map which holds a Set of Nodes for the value
+ *   FilterCacheKey, which yields a Map which holds an arr of Nodes for the value
  *   that the filter is trying to query against.
  *   This object lives in query/query-runner.js and is passed down runQuery.
  *   If it is undefined or null, do not consider to use a fast index at all.
